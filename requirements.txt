@@ -1,0 +1,13 @@
+librosa
+numpy
+soundfile
+pydub
+torch
+torchaudio
+pedalboard
+crepe
+demucs
+roformer-separation
+rvc
+boto3
+tqdm
