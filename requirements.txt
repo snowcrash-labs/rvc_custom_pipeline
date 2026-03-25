@@ -13,7 +13,7 @@ demucs
 melband-roformer-infer
 ml-collections
 pyyaml
-crepe
+torchcrepe
 rvc
 boto3
 tqdm

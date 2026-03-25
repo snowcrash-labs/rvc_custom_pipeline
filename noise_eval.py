@@ -108,15 +108,22 @@ def compute_crepe_confidence(
     Returns:
         (mean_confidence_all, mean_confidence_voiced)
     """
-    import crepe
+    import torch
+    import torchcrepe
 
-    _, _, confidence, _ = crepe.predict(
-        y, sr,
-        model_capacity=model_capacity,
-        step_size=step_size,
-        viterbi=False,
-        verbose=0,
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    audio_tensor = torch.from_numpy(y).unsqueeze(0).float().to(device)
+    hop = int(sr * step_size / 1000)
+
+    _, _, confidence, _ = torchcrepe.predict(
+        audio_tensor, sr,
+        hop_length=hop,
+        model=model_capacity,
+        batch_size=2048,
+        device=device,
+        return_periodicity=True,
     )
+    confidence = confidence.squeeze().cpu().numpy()
 
     mean_all = float(np.mean(confidence))
     voiced_mask = confidence >= voiced_threshold
