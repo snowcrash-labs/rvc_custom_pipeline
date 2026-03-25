@@ -299,6 +299,57 @@ def process_batch(
     return results
 
 
+def _is_s3_uri(path_str: str) -> bool:
+    return path_str.startswith("s3://")
+
+
+def _download_s3_dir(s3_uri: str, local_dir: Path, extensions: Optional[list] = None) -> Path:
+    """Download files from an S3 prefix to a local directory.
+
+    Args:
+        s3_uri: S3 URI prefix (e.g. ``s3://bucket/prefix/``).
+        local_dir: local directory to download into.
+        extensions: if set, only download files with these extensions (e.g. [".pth", ".index"]).
+
+    Returns:
+        local_dir.
+    """
+    import subprocess
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    if extensions:
+        for ext in extensions:
+            subprocess.run(
+                ["aws", "s3", "cp", s3_uri, str(local_dir) + "/",
+                 "--recursive", "--exclude", "*", "--include", f"*{ext}"],
+                check=True,
+            )
+    else:
+        subprocess.run(
+            ["aws", "s3", "cp", s3_uri, str(local_dir) + "/", "--recursive"],
+            check=True,
+        )
+    logger.info("Downloaded S3 prefix %s -> %s", s3_uri, local_dir)
+    return local_dir
+
+
+def _upload_s3_dir(local_dir: Path, s3_uri: str) -> List[str]:
+    """Upload all files in local_dir to an S3 prefix."""
+    import subprocess
+    s3_uri = s3_uri.rstrip("/") + "/"
+    subprocess.run(
+        ["aws", "s3", "cp", str(local_dir) + "/", s3_uri, "--recursive"],
+        check=True,
+    )
+    uploaded = []
+    for f in local_dir.rglob("*"):
+        if f.is_file():
+            rel = f.relative_to(local_dir)
+            uploaded.append(f"{s3_uri}{rel}")
+    logger.info("Uploaded %d files to %s", len(uploaded), s3_uri)
+    return uploaded
+
+
 if __name__ == "__main__":
     import argparse
 
@@ -311,10 +362,12 @@ if __name__ == "__main__":
         description="SVDD dataset generation pipeline: separate -> dereverb -> desilence -> RVC -> remix",
     )
     input_group = p.add_mutually_exclusive_group(required=True)
-    input_group.add_argument("--input-dir", type=Path, help="Directory of source audio tracks")
-    input_group.add_argument("--input-file", type=Path, help="Single source audio track")
-    p.add_argument("--checkpoint-dir", type=Path, required=True, help="RVC checkpoint directory (.pth + .index)")
-    p.add_argument("--output-dir", type=Path, required=True, help="Output root directory")
+    input_group.add_argument("--input-dir", type=str, help="Directory of source audio tracks")
+    input_group.add_argument("--input-file", type=str, help="Single source audio track")
+    p.add_argument("--checkpoint-dir", type=str, required=True,
+                   help="RVC checkpoint directory (.pth + .index), local path or s3:// URI")
+    p.add_argument("--output-dir", type=str, required=True,
+                   help="Output root directory, local path or s3:// URI")
     p.add_argument("--glob", default="*.wav", help="Glob pattern for input files (default *.wav)")
     p.add_argument("--s3-dest", default=None, help="S3 URI prefix to upload outputs (e.g. s3://bucket/prefix/)")
 
@@ -348,6 +401,34 @@ if __name__ == "__main__":
 
     args = p.parse_args()
 
+    # --- Resolve S3 paths ---
+    _cleanup_temps = []
+
+    checkpoint_dir_str = args.checkpoint_dir
+    if _is_s3_uri(checkpoint_dir_str):
+        ckpt_tmp = Path(tempfile.mkdtemp(prefix="svdd_ckpt_"))
+        _cleanup_temps.append(ckpt_tmp)
+        logger.info("Downloading checkpoint from S3: %s", checkpoint_dir_str)
+        _download_s3_dir(checkpoint_dir_str, ckpt_tmp, extensions=[".pth", ".index"])
+        checkpoint_dir = ckpt_tmp
+    else:
+        checkpoint_dir = Path(checkpoint_dir_str)
+
+    output_dir_str = args.output_dir
+    s3_output_dest = None
+    if _is_s3_uri(output_dir_str):
+        s3_output_dest = output_dir_str
+        output_dir = Path(tempfile.mkdtemp(prefix="svdd_out_"))
+        _cleanup_temps.append(output_dir)
+        logger.info("Output will be written locally then uploaded to S3: %s", s3_output_dest)
+    else:
+        output_dir = Path(output_dir_str)
+
+    s3_dest = args.s3_dest or s3_output_dest
+
+    input_file = Path(args.input_file) if args.input_file else None
+    input_dir = Path(args.input_dir) if args.input_dir else None
+
     sep_backend = SeparationBackend(args.sep_backend) if args.sep_backend else None
     common_kwargs = dict(
         sep_backend=sep_backend,
@@ -364,9 +445,9 @@ if __name__ == "__main__":
         min_segment_len=args.min_segment_len,
     )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.input_file:
+    if input_file:
         dereverb = None
         if args.dereverb_model_path and args.dereverb_params_path:
             dereverb = Dereverberation(
@@ -377,16 +458,16 @@ if __name__ == "__main__":
             dereverb.load()
 
         result = process_track(
-            args.input_file, args.checkpoint_dir, args.output_dir,
+            input_file, checkpoint_dir, output_dir,
             dereverb_model=dereverb,
             **common_kwargs,
         )
         results = [result] if result else []
     else:
         results = process_batch(
-            input_dir=args.input_dir,
-            checkpoint_dir=args.checkpoint_dir,
-            output_root=args.output_dir,
+            input_dir=input_dir,
+            checkpoint_dir=checkpoint_dir,
+            output_root=output_dir,
             glob_pattern=args.glob,
             dereverb_model_path=args.dereverb_model_path,
             dereverb_params_path=args.dereverb_params_path,
@@ -394,17 +475,26 @@ if __name__ == "__main__":
             **common_kwargs,
         )
 
-    if args.s3_dest and results:
+    if s3_dest and results:
         for r in results:
             if r.get("skipped"):
                 continue
             stem = _output_stem(r["source_md5"], r["rvc_md5"])
             try:
-                s3_uris = upload_to_s3(args.output_dir, stem, args.s3_dest)
+                s3_uris = upload_to_s3(output_dir, stem, s3_dest)
                 r["s3_uris"] = s3_uris
             except Exception as e:
                 logger.error("S3 upload failed for %s: %s", stem, e)
 
-    summary_path = args.output_dir / "pipeline_summary.json"
+    summary_path = output_dir / "pipeline_summary.json"
     summary_path.write_text(json.dumps(results, indent=2, default=str))
     print(f"\nDone. {len(results)} tracks processed. Summary: {summary_path}")
+
+    if s3_output_dest:
+        try:
+            _upload_s3_dir(output_dir, s3_output_dest)
+            print(f"Outputs uploaded to {s3_output_dest}")
+        except Exception as e:
+            logger.error("S3 upload of output directory failed: %s", e)
+            print(f"WARNING: S3 upload failed, local outputs preserved at {output_dir}")
+            _cleanup_temps.remove(output_dir)
