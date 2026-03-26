@@ -125,7 +125,7 @@ python dereverberation.py vocals.wav --backend vrnet --force
 ### Full pipeline (single track)
 
 ```bash
-python pipeline.py \
+python vc_pipeline.py \
     --input-file "song.wav" \
     --checkpoint-dir /path/to/rvc_model/ \
     --output-dir /output/ \
@@ -139,7 +139,7 @@ python pipeline.py \
 ### Full pipeline (batch)
 
 ```bash
-python pipeline.py \
+python vc_pipeline.py \
     --input-dir /data/tracks/ \
     --checkpoint-dir /path/to/rvc_model/ \
     --output-dir /output/ \
@@ -151,7 +151,7 @@ python pipeline.py \
 ### S3 integration (for EC2)
 
 ```bash
-python pipeline.py \
+python vc_pipeline.py \
     --input-dir s3://bucket/input-tracks/ \
     --checkpoint-dir s3://bucket/rvc-checkpoints/singer-a/ \
     --output-dir s3://bucket/output/ \
@@ -197,7 +197,7 @@ sep = random.choices(list(SEP_WEIGHTS), weights=SEP_WEIGHTS.values())[0]
 dereverb = random.choices(list(DEREVERB_WEIGHTS), weights=DEREVERB_WEIGHTS.values())[0]
 
 cmd = [
-    "python", "pipeline.py",
+    "python", "vc_pipeline.py",
     "--input-file", "song.wav",
     "--checkpoint-dir", "/path/to/rvc/",
     "--output-dir", "/output/",

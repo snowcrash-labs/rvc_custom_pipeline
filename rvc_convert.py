@@ -41,12 +41,19 @@ def _default_rvc_assets_root() -> Path:
     env = os.environ.get("RVC_ASSETS_ROOT")
     if env:
         return Path(env)
-    return Path(tempfile.gettempdir()) / "rvc_assets"
+    return Path(__file__).resolve().parent / "models" / "rvc_assets"
 
 
 RVC_ASSETS_ROOT = _default_rvc_assets_root()
 
 _vc_instance = None
+
+
+def _load_audio_librosa(file, sr):
+    """Load audio with librosa, bypassing rvc's av-based loader."""
+    import librosa
+    y, _ = librosa.load(str(file), sr=sr, mono=True)
+    return y.astype(np.float32)
 
 
 def _get_vc(pth_path: Path, index_path: Optional[Path] = None):
@@ -58,6 +65,9 @@ def _get_vc(pth_path: Path, index_path: Optional[Path] = None):
     os.environ.setdefault("weight_root", str(RVC_ASSETS_ROOT / "weights"))
     os.environ.setdefault("hubert_path", str(RVC_ASSETS_ROOT / "assets" / "hubert" / "hubert_base.pt"))
     os.environ.setdefault("rmvpe_root", str(RVC_ASSETS_ROOT / "assets" / "rmvpe"))
+
+    import rvc.lib.audio as rvc_audio
+    rvc_audio.load_audio = _load_audio_librosa
 
     from rvc.modules.vc.modules import VC
 
@@ -92,17 +102,33 @@ def run_rvc_infer(
     """Run RVC inference using the Python API directly."""
     try:
         vc = _get_vc(pth_path, index_path)
-        tgt_sr, audio_opt, times, _ = vc.vc_inference(
+        index_str = str(index_path) if index_path and index_path.exists() else ""
+        tgt_sr, audio_opt, times, _ = vc.vc_single(
             sid=0,
             input_audio_path=str(input_wav),
             f0_up_key=f0_up_key,
             f0_method=f0_method,
-            index_file=str(index_path) if index_path and index_path.exists() else None,
+            index_file=index_str,
+            index_rate=0.75,
+            filter_radius=3,
+            resample_sr=0,
+            rms_mix_rate=0.25,
+            protect=0.33,
             hubert_path=os.environ.get("hubert_path"),
         )
         if audio_opt is None:
             logger.warning("RVC returned None audio for %s", input_wav.name)
             return False
+
+        target_sr = 44100
+        if tgt_sr != target_sr:
+            import librosa
+            audio_float = audio_opt.astype(np.float32)
+            if audio_float.max() > 1.0 or audio_float.min() < -1.0:
+                audio_float = audio_float / 32768.0
+            audio_float = librosa.resample(audio_float, orig_sr=tgt_sr, target_sr=target_sr)
+            audio_opt = (audio_float * 32768.0).clip(-32768, 32767).astype(np.int16)
+            tgt_sr = target_sr
 
         from scipy.io import wavfile
         wavfile.write(str(output_wav), tgt_sr, audio_opt)
