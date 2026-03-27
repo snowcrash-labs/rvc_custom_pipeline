@@ -91,15 +91,25 @@ def export_segments(
 
 def write_timestamps_csv(
     segments: List[VocalSegment],
-    csv_path: Path,
+    audio_path: Path,
+    output_dir: Path,
 ) -> Path:
-    """Write segment timestamps to CSV."""
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    """Write vocal segment timestamps to CSV.
+
+    The CSV is named ``{stem}_vad_seg_ts.csv`` and contains start/end
+    times in seconds, suitable for use as annotation data in tools like
+    Sonic Visualiser or Audacity.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = output_dir / f"{audio_path.stem}_vad_seg_ts.csv"
     with open(csv_path, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["segment_index", "start_ms", "end_ms", "duration_ms", "filename"])
+        writer.writerow(["start_time", "end_time"])
         for seg in segments:
-            writer.writerow([seg.index, seg.start_ms, seg.end_ms, seg.duration_ms, seg.filename])
+            writer.writerow([
+                round(seg.start_ms / 1000.0, 6),
+                round(seg.end_ms / 1000.0, 6),
+            ])
     logger.info("Wrote %d segment timestamps to %s", len(segments), csv_path)
     return csv_path
 
@@ -114,7 +124,9 @@ def desilence_and_track(
 ) -> Tuple[List[Path], List[VocalSegment], Path]:
     """Full desilencing pipeline: detect, export segments, write CSV.
 
-    The CSV is saved inside output_dir as ``timestamps.csv``.
+    The CSV is saved inside *output_dir* as
+    ``{audio_stem}_vad_seg_ts.csv`` with ``start_time`` / ``end_time``
+    columns in seconds.
 
     Returns:
         (segment_wav_paths, segments, csv_path)
@@ -128,10 +140,11 @@ def desilence_and_track(
     )
     if not segments:
         logger.warning("No vocal segments found in %s", audio_path.name)
-        return [], [], output_dir / "timestamps.csv"
+        csv_path = output_dir / f"{audio_path.stem}_vad_seg_ts.csv"
+        return [], [], csv_path
 
     wav_paths = export_segments(audio, segments, output_dir)
-    csv_path = write_timestamps_csv(segments, output_dir / "timestamps.csv")
+    csv_path = write_timestamps_csv(segments, audio_path, output_dir)
     return wav_paths, segments, csv_path
 
 
@@ -169,18 +182,25 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Desilence vocals with timestamp tracking")
     p.add_argument("input", type=Path, help="Input vocal wav")
     p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--export-chunks", action="store_true",
+                   help="Also export individual segment wav files")
     p.add_argument("--min-silence-len", type=int, default=2000)
     p.add_argument("--silence-thresh", type=int, default=-40)
     p.add_argument("--keep-silence", type=int, default=100)
     p.add_argument("--min-segment-len", type=int, default=3000)
     args = p.parse_args()
 
-    out_dir = args.output_dir or args.input.parent / args.input.stem
-    paths, segs, csv_p = desilence_and_track(
-        args.input, out_dir,
+    out_dir = args.output_dir or args.input.parent
+    audio, segs = detect_vocal_segments(
+        args.input,
         min_silence_len=args.min_silence_len,
         silence_thresh=args.silence_thresh,
         keep_silence=args.keep_silence,
         min_segment_len=args.min_segment_len,
     )
-    print(f"Exported {len(paths)} segments, timestamps at {csv_p}")
+    csv_p = write_timestamps_csv(segs, args.input, out_dir)
+    print(f"Found {len(segs)} vocal segments, timestamps at {csv_p}")
+
+    if args.export_chunks:
+        paths = export_segments(audio, segs, out_dir)
+        print(f"Exported {len(paths)} segment wav files to {out_dir}")

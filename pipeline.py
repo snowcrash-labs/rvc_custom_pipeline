@@ -4,8 +4,8 @@ transposition for an RVC model before running the voice conversion pipeline.
 
 Steps:
   1. Convert a sweep test audio file (vocal scales) through RVC at f0_up_key=0.
-  2. Analyse the RVC output with HNR range detection to find the model's
-     usable pitch range.
+  2. Analyse the RVC output with pitch-stability analysis to find the
+     model's usable pitch range (F0 std / voiced ratio per window).
   3. Separate vocals from the target song so pitch analysis is not
      confused by instrumental content.
   4. Analyse the separated vocals to determine the singer's average pitch
@@ -48,8 +48,9 @@ def _run_rvc_sweep(
         return None
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_hash = _short_hash(checkpoint_dir)
-    output_wav = output_dir / f"sweep_rvc_{ckpt_hash}.wav"
+    model_hash = _short_hash(checkpoint_dir)
+    audio_hash = _short_hash(sweep_audio)
+    output_wav = output_dir / f"sweep_rvc_model_{model_hash}_audio_{audio_hash}.wav"
 
     if output_wav.exists() and not force:
         logger.info("Sweep RVC output already exists, reusing: %s", output_wav)
@@ -75,40 +76,55 @@ def _run_rvc_sweep(
     return output_wav
 
 
-def _analyse_hnr(
+def _analyse_pitch_stability(
     rvc_sweep_wav: Path,
-    method: str = "autocorrelation",
-    threshold: float = 2.5,
+    output_dir: Path,
+    std_threshold: float = 3.0,
+    voiced_threshold: float = 0.9,
+    hnr_threshold: float = 6.0,
+    window_ms: int = 500,
 ) -> dict | None:
-    """Run HNR range analysis and return the usable range."""
-    from hnr_range import analyse_hnr_by_note
+    """Run pitch-stability range analysis and return the usable range.
 
-    logger.info("Analysing HNR range (method=%s, threshold=%.1f dB)...", method, threshold)
-    results = analyse_hnr_by_note(
-        rvc_sweep_wav,
-        method=method,
-        hnr_threshold_db=threshold,
+    Also writes a per-frame F0 CSV alongside the sweep file for
+    inspection in Sonic Visualiser.
+    """
+    from hnr_range import analyse_pitch_stability
+
+    csv_path = output_dir / (rvc_sweep_wav.stem + ".f0.csv")
+
+    logger.info(
+        "Analysing pitch stability (std<%.1f semi, voiced>=%.0f%%, "
+        "HNR>=%.1f dB, window=%dms)...",
+        std_threshold, voiced_threshold * 100, hnr_threshold, window_ms,
     )
-
-    if "error" in results:
-        logger.error("HNR analysis failed: %s", results["error"])
-        return None
+    results = analyse_pitch_stability(
+        rvc_sweep_wav,
+        std_threshold_semitones=std_threshold,
+        voiced_ratio_threshold=voiced_threshold,
+        hnr_threshold_db=hnr_threshold,
+        window_ms=window_ms,
+        csv_path=csv_path,
+    )
 
     usable = results["usable_range"]
     if not usable.get("low"):
-        logger.error("No usable range detected above %.1f dB threshold", threshold)
+        logger.error("No usable range detected with current thresholds")
         return None
 
     logger.info(
-        "Usable range: %s (%s Hz) — %s (%s Hz)",
+        "Usable range: %s (%s Hz) — %s (%s Hz)  [%s — %s]",
         usable["low"], usable["low_hz"],
         usable["high"], usable["high_hz"],
+        usable["low_time"], usable["high_time"],
     )
+    logger.info("F0 CSV for Sonic Visualiser: %s", csv_path)
     return usable
 
 
 def _separate_vocals(
     input_audio: Path,
+    checkpoint_dir: Path,
     output_dir: Path,
     sep_backend: str,
     device: str | None = None,
@@ -121,9 +137,10 @@ def _separate_vocals(
     """
     from separation import SeparationBackend, separate
 
-    input_hash = _short_hash(input_audio)
-    vocals_out = output_dir / f"separated_vocals_{input_hash}.wav"
-    instrumental_out = output_dir / f"separated_instrumental_{input_hash}.wav"
+    model_hash = _short_hash(checkpoint_dir)
+    audio_hash = _short_hash(input_audio)
+    vocals_out = output_dir / f"separated_vocals_model_{model_hash}_audio_{audio_hash}.wav"
+    instrumental_out = output_dir / f"separated_instrumental_model_{model_hash}_audio_{audio_hash}.wav"
 
     if vocals_out.exists() and not force:
         logger.info("Separated vocals already cached, reusing: %s", vocals_out)
@@ -184,6 +201,8 @@ def _run_vc_pipeline(
     force: bool = False,
     pre_separated_vocals: Path | None = None,
     dereverb_backend: str | None = None,
+    do_desilence: bool = False,
+    do_reassembly: bool = False,
     extra_args: list[str] | None = None,
 ) -> int:
     """Run vc_pipeline.py as a subprocess with the computed transposition.
@@ -206,8 +225,6 @@ def _run_vc_pipeline(
         "--output-dir", str(output_dir),
         "--f0-up-key", str(f0_up_key),
         "--f0-method", f0_method,
-        "--no-desilence",
-        "--no-reassembly",
     ]
     if skip_sep:
         cmd.append("--no-separation")
@@ -215,6 +232,10 @@ def _run_vc_pipeline(
         cmd.extend(["--sep-backend", sep_backend])
     if dereverb_backend:
         cmd.extend(["--dereverb-backend", dereverb_backend])
+    if not do_desilence:
+        cmd.append("--no-desilence")
+    if not do_reassembly:
+        cmd.append("--no-reassembly")
     if force:
         cmd.append("--force")
     if extra_args:
@@ -232,7 +253,7 @@ def main():
     )
 
     p = argparse.ArgumentParser(
-        description="Auto-transpose pipeline: sweep -> HNR analysis -> pitch match -> vc_pipeline",
+        description="Auto-transpose pipeline: sweep -> pitch stability -> pitch match -> vc_pipeline",
     )
     p.add_argument("--sweep-audio", type=Path, required=True,
                    help="Vocal scale sweep test file (WAV)")
@@ -246,14 +267,23 @@ def main():
                    choices=["demucs", "roformer", "mdxchain", "uvr5"],
                    help="Separation backend (default: mdxchain)")
     p.add_argument("--f0-method", default="rmvpe")
-    p.add_argument("--hnr-method", default="autocorrelation",
-                   choices=["autocorrelation", "cepstral", "spectral"])
-    p.add_argument("--hnr-threshold", type=float, default=5.0,
-                   help="HNR threshold in dB (default: 5.0)")
+    p.add_argument("--std-threshold", type=float, default=3.0,
+                   help="Pitch std threshold in semitones for stability analysis (default: 3.0)")
+    p.add_argument("--voiced-threshold", type=float, default=0.9,
+                   help="Min voiced frame ratio per window (default: 0.9)")
+    p.add_argument("--hnr-threshold", type=float, default=6.0,
+                   help="Max HNR drop (dB) from trailing baseline (default: 6.0)")
+    p.add_argument("--window-ms", type=int, default=500,
+                   help="Analysis window size in ms (default: 500)")
     p.add_argument("--device", default=None,
                    help="Torch device for separation (default: auto)")
     p.add_argument("--dereverb-backend", choices=["vrnet", "mbr"], default=None,
                    help="Dereverb backend passed to vc_pipeline.py (omit to skip)")
+    p.add_argument("--no-desilence", action="store_true",
+                   help="Skip desilencing — treat the whole track as one segment")
+    p.add_argument("--no-reassembly", action="store_true",
+                   help="Skip reassembly — output processed audio without mixing "
+                        "back with the instrumental stem")
     p.add_argument("--override-transpose", type=int, default=None,
                    help="Skip auto-detection and use this semitone value directly")
     p.add_argument("--no-cache", action="store_true",
@@ -286,17 +316,24 @@ def main():
         if sweep_wav is None:
             sys.exit(1)
 
-        # ── Step 2: HNR analysis ───────────────────────────────────────
+        # ── Step 2: Pitch stability analysis ──────────────────────────
         print(f"\n{'=' * 64}")
-        print("  Step 2: Analysing RVC model usable range (HNR)")
+        print("  Step 2: Analysing RVC model usable range (pitch stability)")
         print(f"{'=' * 64}\n")
 
-        usable = _analyse_hnr(sweep_wav, args.hnr_method, args.hnr_threshold)
+        usable = _analyse_pitch_stability(
+            sweep_wav, sweep_dir,
+            std_threshold=args.std_threshold,
+            voiced_threshold=args.voiced_threshold,
+            hnr_threshold=args.hnr_threshold,
+            window_ms=args.window_ms,
+        )
         if usable is None:
             sys.exit(1)
 
         print(f"  Usable range: {usable['low']} ({usable['low_hz']} Hz) — "
-              f"{usable['high']} ({usable['high_hz']} Hz)\n")
+              f"{usable['high']} ({usable['high_hz']} Hz)")
+        print(f"  Time window:  {usable['low_time']}s — {usable['high_time']}s\n")
 
         # ── Step 3: Separate vocals for pitch analysis ──────────────────
         print(f"{'=' * 64}")
@@ -304,7 +341,7 @@ def main():
         print(f"{'=' * 64}\n")
 
         vocals_path = _separate_vocals(
-            args.input_file, sweep_dir,
+            args.input_file, args.checkpoint_dir, sweep_dir,
             sep_backend=args.sep_backend,
             device=args.device,
             force=args.no_cache,
@@ -349,6 +386,8 @@ def main():
         force=args.force,
         pre_separated_vocals=vocals_path,
         dereverb_backend=args.dereverb_backend,
+        do_desilence=not args.no_desilence,
+        do_reassembly=not args.no_reassembly,
     )
 
     if rc != 0:

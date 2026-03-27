@@ -14,8 +14,6 @@ For each input audio track this pipeline:
      checkpoint.
   5. **Reassembly** places converted segments at their original timestamps
      and **mixes** with the instrumental track.
-  6. (Optional) **Noise evaluation** flags outputs whose HNR or CREPE
-     confidence fall below quality thresholds.
 
 All outputs for a given track are placed in a single directory:
     {output_root}/source_{audio_md5}_rvcmodel_{rvc_md5}/
@@ -50,8 +48,6 @@ from rvc_convert import (
     md5_of_file,
     md5_of_string,
 )
-from noise_eval import evaluate_noise
-
 try:
     import boto3
     _s3 = boto3.client("s3")
@@ -80,9 +76,6 @@ def process_track(
     dereverb_probability: float = DEREVERB_PROBABILITY,
     f0_up_key: int = 0,
     f0_method: str = "rmvpe",
-    noise_eval: bool = False,
-    hnr_threshold_db: float = 10.0,
-    crepe_threshold: float = 0.6,
     device: Optional[str] = None,
     min_silence_len: int = 2000,
     silence_thresh: int = -40,
@@ -193,7 +186,7 @@ def process_track(
             if not seg_paths:
                 logger.warning("No segments found for %s", input_audio.name)
                 return None
-            output_csv = output_dir / "timestamps.csv"
+            output_csv = output_dir / f"{vocals_processed.stem}_vad_seg_ts.csv"
             shutil.copy2(csv_path, output_csv)
         else:
             logger.info("Desilencing skipped — treating whole track as one segment")
@@ -255,18 +248,6 @@ def process_track(
                 logger.info("No instrumental track — output is processed audio only")
             logger.info("Output exported: %s", final_wav.name)
 
-    # --- 6. Noise evaluation (optional) ---
-    noise_result = None
-    if noise_eval:
-        try:
-            noise_result = evaluate_noise(
-                final_wav,
-                hnr_threshold_db=hnr_threshold_db,
-                crepe_threshold=crepe_threshold,
-            )
-        except Exception as e:
-            logger.warning("Noise evaluation failed: %s", e)
-
     # --- Write per-track metadata ---
     metadata = {
         "source_audio": str(input_audio),
@@ -290,9 +271,6 @@ def process_track(
     }
     if output_csv:
         metadata["timestamps_csv"] = str(output_csv)
-    if noise_result:
-        metadata["noise_eval"] = noise_result.details
-        metadata["noise_is_clean"] = noise_result.is_clean
 
     meta_path = output_dir / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2))
@@ -496,11 +474,6 @@ if __name__ == "__main__":
     rvc_group.add_argument("--f0-up-key", type=int, default=0, help="Pitch shift in semitones")
     rvc_group.add_argument("--f0-method", default="rmvpe")
 
-    eval_group = p.add_argument_group("noise evaluation")
-    eval_group.add_argument("--noise-eval", action="store_true", help="Run HNR/CREPE noise evaluation on outputs")
-    eval_group.add_argument("--hnr-threshold", type=float, default=10.0)
-    eval_group.add_argument("--crepe-threshold", type=float, default=0.6)
-
     args = p.parse_args()
 
     do_rvc = not args.no_rvc
@@ -548,9 +521,6 @@ if __name__ == "__main__":
         device=args.device,
         f0_up_key=args.f0_up_key,
         f0_method=args.f0_method,
-        noise_eval=args.noise_eval,
-        hnr_threshold_db=args.hnr_threshold,
-        crepe_threshold=args.crepe_threshold,
         min_silence_len=args.min_silence_len,
         silence_thresh=args.silence_thresh,
         keep_silence=args.keep_silence,
