@@ -203,6 +203,8 @@ def _run_vc_pipeline(
     dereverb_backend: str | None = None,
     do_desilence: bool = False,
     do_reassembly: bool = False,
+    do_lyrics_eval: bool = False,
+    whisper_model: str = "turbo",
     extra_args: list[str] | None = None,
 ) -> int:
     """Run vc_pipeline.py as a subprocess with the computed transposition.
@@ -236,6 +238,8 @@ def _run_vc_pipeline(
         cmd.append("--no-desilence")
     if not do_reassembly:
         cmd.append("--no-reassembly")
+    if do_lyrics_eval:
+        cmd.extend(["--lyrics-eval", "--whisper-model", whisper_model])
     if force:
         cmd.append("--force")
     if extra_args:
@@ -284,6 +288,10 @@ def main():
     p.add_argument("--no-reassembly", action="store_true",
                    help="Skip reassembly — output processed audio without mixing "
                         "back with the instrumental stem")
+    p.add_argument("--lyrics-eval", action="store_true",
+                   help="Evaluate VC quality by comparing source/converted lyrics (WER)")
+    p.add_argument("--whisper-model", default="turbo",
+                   help="Whisper model for lyrics eval (default: turbo)")
     p.add_argument("--override-transpose", type=int, default=None,
                    help="Skip auto-detection and use this semitone value directly")
     p.add_argument("--no-cache", action="store_true",
@@ -388,6 +396,8 @@ def main():
         dereverb_backend=args.dereverb_backend,
         do_desilence=not args.no_desilence,
         do_reassembly=not args.no_reassembly,
+        do_lyrics_eval=args.lyrics_eval,
+        whisper_model=args.whisper_model,
     )
 
     if rc != 0:

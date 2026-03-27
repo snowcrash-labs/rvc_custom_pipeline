@@ -85,6 +85,8 @@ def process_track(
     do_desilence: bool = True,
     do_rvc: bool = True,
     do_reassembly: bool = True,
+    do_lyrics_eval: bool = False,
+    whisper_model: str = "turbo",
     force: bool = False,
 ) -> Optional[dict]:
     """Run the full pipeline on a single audio track.
@@ -220,6 +222,31 @@ def process_track(
             num_converted = len(seg_paths)
             final_segments_dir = segments_dir
 
+        # --- 4.5 Lyrics evaluation (WER) ---
+        lyrics_eval_result = None
+        if do_lyrics_eval:
+            try:
+                from lyrics_eval import evaluate_lyrics_similarity
+
+                source_dur = AudioSegment.from_file(str(vocals_processed))
+                converted_vocals = reassemble_from_segments(
+                    final_segments_dir, segments, len(source_dur),
+                )
+                converted_eval_wav = tmp / "converted_eval.wav"
+                converted_vocals.export(str(converted_eval_wav), format="wav")
+
+                lyrics_eval_result = evaluate_lyrics_similarity(
+                    vocals_processed, converted_eval_wav,
+                    model_name=whisper_model,
+                    output_dir=output_dir,
+                )
+                logger.info(
+                    "Lyrics eval: WER=%.3f  CER=%.3f",
+                    lyrics_eval_result.wer, lyrics_eval_result.cer,
+                )
+            except Exception as e:
+                logger.warning("Lyrics evaluation failed: %s", e)
+
         # --- 5. Reassemble + mix with instrumental ---
         if do_reassembly and do_separation and instrumental.exists():
             instrumental_audio = AudioSegment.from_file(str(instrumental))
@@ -271,6 +298,16 @@ def process_track(
     }
     if output_csv:
         metadata["timestamps_csv"] = str(output_csv)
+    if lyrics_eval_result is not None:
+        metadata["lyrics_eval"] = {
+            "source_text": lyrics_eval_result.source_text,
+            "converted_text": lyrics_eval_result.converted_text,
+            "source_language": lyrics_eval_result.source_language,
+            "converted_language": lyrics_eval_result.converted_language,
+            "wer": lyrics_eval_result.wer,
+            "cer": lyrics_eval_result.cer,
+            **lyrics_eval_result.details,
+        }
 
     meta_path = output_dir / "metadata.json"
     meta_path.write_text(json.dumps(metadata, indent=2))
@@ -474,6 +511,12 @@ if __name__ == "__main__":
     rvc_group.add_argument("--f0-up-key", type=int, default=0, help="Pitch shift in semitones")
     rvc_group.add_argument("--f0-method", default="rmvpe")
 
+    eval_group = p.add_argument_group("evaluation")
+    eval_group.add_argument("--lyrics-eval", action="store_true",
+                            help="Evaluate VC quality by comparing source/converted lyrics (WER)")
+    eval_group.add_argument("--whisper-model", default="turbo",
+                            help="Whisper model for lyrics eval (default: turbo)")
+
     args = p.parse_args()
 
     do_rvc = not args.no_rvc
@@ -529,6 +572,8 @@ if __name__ == "__main__":
         do_desilence=do_desilence,
         do_rvc=do_rvc,
         do_reassembly=do_reassembly,
+        do_lyrics_eval=args.lyrics_eval,
+        whisper_model=args.whisper_model,
         force=args.force,
     )
 
