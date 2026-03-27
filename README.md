@@ -4,7 +4,37 @@ End-to-end pipeline for generating voice-converted audio with diverse
 preprocessing artefacts, designed for SVDD (Singing Voice Deepfake Detection)
 dataset generation.
 
-## Pipeline stages
+## Pipeline overview
+
+There are two entry points:
+
+- **`pipeline.py`** — the auto-transpose orchestrator. Determines the
+  optimal pitch shift for an RVC model by running a vocal sweep through
+  it, analysing pitch stability, then invoking `vc_pipeline.py` with the
+  computed transposition.
+- **`vc_pipeline.py`** — the core voice conversion pipeline that handles
+  separation, dereverberation, desilencing, RVC conversion, and
+  reassembly.
+
+### Auto-transpose orchestrator (`pipeline.py`)
+
+```
+Sweep audio ──► RVC at f0=0 ──► Pitch stability analysis ──┐
+                                                            ├──► transposition
+Input song ──► Separation ──► Singer pitch analysis ────────┘
+                    │
+                    └──► vc_pipeline.py (with computed f0_up_key)
+```
+
+Steps:
+1. Convert a vocal scale sweep through the RVC model at f0_up_key=0.
+2. Analyse the converted sweep with pitch stability + relative HNR to
+   find the model's usable pitch range.
+3. Separate vocals from the target song for pitch analysis.
+4. Analyse the singer's pitch and compute the nearest-octave transposition.
+5. Run `vc_pipeline.py` with the computed shift.
+
+### Core pipeline stages (`vc_pipeline.py`)
 
 ```
 Input audio
@@ -19,9 +49,7 @@ Input audio
   │
   ├─ 4. RVC conversion ──── voice-converted segments
   │
-  ├─ 5. Reassembly ──────── converted vocals overlaid on instrumentals
-  │
-  └─ 6. Noise evaluation ── optional HNR / CREPE quality gate
+  └─ 5. Reassembly ──────── converted vocals overlaid on instrumentals
 ```
 
 ## Environment setup
@@ -101,6 +129,66 @@ Both apply a NoiseGate (−40 dB) after dereverberation.
 
 ## Usage examples
 
+### Auto-transpose pipeline (recommended)
+
+```bash
+# Full auto-transpose pipeline: determines optimal pitch shift automatically
+python pipeline.py \
+    --sweep-audio test_audio/full_range_vocal_scale_mono.wav \
+    --input-file "song.wav" \
+    --checkpoint-dir /path/to/rvc_model/ \
+    --output-dir outputs \
+    --sep-backend roformer \
+    --dereverb-backend mbr
+
+# Skip pitch detection and use a manual transposition
+python pipeline.py \
+    --sweep-audio test_audio/full_range_vocal_scale_mono.wav \
+    --input-file "song.wav" \
+    --checkpoint-dir /path/to/rvc_model/ \
+    --output-dir outputs \
+    --override-transpose -12
+
+# Tune the pitch stability analysis thresholds
+python pipeline.py \
+    --sweep-audio test_audio/full_range_vocal_scale_mono.wav \
+    --input-file "song.wav" \
+    --checkpoint-dir /path/to/rvc_model/ \
+    --output-dir outputs \
+    --std-threshold 3.0 \
+    --voiced-threshold 0.9 \
+    --hnr-threshold 6.0 \
+    --window-ms 500
+
+# Force regeneration of all cached intermediates
+python pipeline.py \
+    --sweep-audio test_audio/full_range_vocal_scale_mono.wav \
+    --input-file "song.wav" \
+    --checkpoint-dir /path/to/rvc_model/ \
+    --output-dir outputs \
+    --no-cache
+```
+
+### Standalone pitch stability analysis
+
+```bash
+# Analyse an RVC-converted sweep (default: pitch_stability method)
+python hnr_range.py sweep_output.wav
+
+# Specify thresholds and output CSV location
+python hnr_range.py sweep_output.wav \
+    --hnr-threshold 6.0 \
+    --voiced-threshold 0.9 \
+    --csv /path/to/output.f0.csv
+
+# Use legacy HNR-only analysis
+python hnr_range.py sweep_output.wav --method autocorrelation
+```
+
+The pitch stability analysis writes a per-frame F0 CSV
+(`{stem}.f0.csv`) with columns `time,f0_hz,f0_midi,voiced,hnr_db`,
+suitable for import into Sonic Visualiser.
+
 ### Standalone separation
 
 ```bash
@@ -122,7 +210,20 @@ python dereverberation.py vocals.wav --backend mbr --force
 python dereverberation.py vocals.wav --backend vrnet --force
 ```
 
-### Full pipeline (single track)
+### Standalone desilencing
+
+```bash
+# Detect vocal segments and write timestamp CSV only
+python desilence.py vocals.wav
+
+# Also export individual segment wav files
+python desilence.py vocals.wav --export-chunks --output-dir segments/
+```
+
+The CSV is named `{stem}_vad_seg_ts.csv` with columns `start_time` and
+`end_time` in seconds.
+
+### Core pipeline (single track)
 
 ```bash
 python vc_pipeline.py \
@@ -136,7 +237,7 @@ python vc_pipeline.py \
     --f0-method rmvpe
 ```
 
-### Full pipeline (batch)
+### Core pipeline (batch)
 
 ```bash
 python vc_pipeline.py \
@@ -144,8 +245,7 @@ python vc_pipeline.py \
     --checkpoint-dir /path/to/rvc_model/ \
     --output-dir /output/ \
     --glob "*.wav" \
-    --dereverb-backend vrnet \
-    --noise-eval
+    --dereverb-backend vrnet
 ```
 
 ### S3 integration (for EC2)
@@ -158,6 +258,41 @@ python vc_pipeline.py \
     --sep-backend mdxchain \
     --dereverb-backend mbr
 ```
+
+## Cached intermediates
+
+`pipeline.py` caches intermediate results in `{output-dir}/_sweep_analysis/`
+to avoid redundant processing across runs. Filenames encode which model
+and audio produced them:
+
+| File | Naming pattern |
+|------|---------------|
+| RVC sweep output | `sweep_rvc_model_{ckpt_hash}_audio_{sweep_hash}.wav` |
+| F0 CSV (Sonic Visualiser) | `sweep_rvc_model_{ckpt_hash}_audio_{sweep_hash}.f0.csv` |
+| Separated vocals | `separated_vocals_model_{ckpt_hash}_audio_{input_hash}.wav` |
+| Separated instrumental | `separated_instrumental_model_{ckpt_hash}_audio_{input_hash}.wav` |
+
+Use `--no-cache` to force regeneration.
+
+## Pitch stability analysis
+
+The usable pitch range of an RVC model is determined by a combined
+analysis of the converted vocal sweep:
+
+1. **F0 tracking** (pYIN) extracts a frame-level pitch contour.
+2. Per-window (default 500 ms) statistics are computed:
+   - **Voiced ratio** — fraction of frames with detected pitch.
+   - **Pitch std** — standard deviation of F0 in semitones.
+   - **Autocorrelation HNR** — harmonic-to-noise ratio.
+3. A window is **stable** when all three conditions hold:
+   - Voiced ratio ≥ 90 % (`--voiced-threshold`)
+   - Pitch std < 3.0 semitones (`--std-threshold`)
+   - HNR has not dropped > 6 dB from the trailing baseline (`--hnr-threshold`)
+4. The longest contiguous run of stable windows defines the usable range.
+
+The relative HNR criterion avoids penalising the low register where HNR
+is naturally lower, while still catching timbral degradation at the upper
+boundary.
 
 ## Randomization strategies
 
