@@ -3,13 +3,13 @@
 
 For each input audio track this pipeline:
 
-  1. **Separates** vocals and instrumentals using a randomly chosen backend
-     (Demucs or Roformer) to introduce diverse separation artefacts.
-  2. **Dereverberation** is applied to the separated vocals with 53%
-     probability (configurable) so the SVDD model sees both reverberant and
-     dry examples.
-  3. **Desilencing** splits the vocals on silence, recording segment
-     timestamps in a CSV file co-located with the audio.
+  1. **Separates** vocals and instrumentals (optional, on by default) using
+     a configurable backend (Demucs, Roformer, MDXChain, UVR5) to introduce
+     diverse separation artefacts.
+  2. **Dereverberation** is applied to the separated vocals when a dereverb
+     backend is specified (``--dereverb-backend``).
+  3. **Desilencing** always runs — splits the vocals on silence, recording
+     segment timestamps in a CSV file co-located with the audio.
   4. **RVC conversion** runs each vocal segment through the target voice
      checkpoint.
   5. **Reassembly** places converted segments at their original timestamps
@@ -34,10 +34,9 @@ from pydub import AudioSegment
 
 from separation import SeparationBackend, separate
 from dereverberation import (
-    DEREVERB_PROBABILITY,
     Dereverberation,
     DereverbMelBandRoformer,
-    maybe_dereverb,
+    apply_dereverb,
 )
 
 _DEREVERB_CLASSES = {"vrnet": Dereverberation, "mbr": DereverbMelBandRoformer}
@@ -73,16 +72,17 @@ def process_track(
     rvc_md5: Optional[str] = None,
     sep_backend: Optional[SeparationBackend] = None,
     dereverb_model: Optional[Dereverberation] = None,
-    dereverb_probability: float = DEREVERB_PROBABILITY,
     f0_up_key: int = 0,
     f0_method: str = "rmvpe",
+    index_rate: float = 0.75,
+    rms_mix_rate: float = 0.25,
+    protect: float = 0.33,
     device: Optional[str] = None,
     min_silence_len: int = 2000,
     silence_thresh: int = -40,
     keep_silence: int = 100,
     min_segment_len: int = 3000,
     do_separation: bool = True,
-    do_desilence: bool = True,
     do_rvc: bool = True,
     do_reassembly: bool = True,
     do_lyrics_eval: bool = False,
@@ -96,11 +96,13 @@ def process_track(
 
     - ``do_separation=False``: input audio is used directly (no
       vocal/instrumental split).
-    - ``do_desilence=False``: the whole track is treated as one segment.
     - ``do_rvc=False``: segments are kept as-is (no voice conversion).
       ``checkpoint_dir`` may be ``None`` when RVC is disabled.
     - ``do_reassembly=False``: output is the processed audio without
       mixing back with an instrumental stem.
+
+    Dereverberation is applied when ``dereverb_model`` is not None.
+    Desilencing always runs (timestamps-only, no audio modification).
 
     Returns a metadata dict on success, None on failure.
     """
@@ -162,11 +164,8 @@ def process_track(
         vocals_processed = tmp / "vocals_processed.wav"
         if dereverb_model is not None:
             try:
-                _, dereverb_applied = maybe_dereverb(
-                    vocals_raw, vocals_processed,
-                    dereverb_model=dereverb_model,
-                    probability=dereverb_probability,
-                )
+                apply_dereverb(vocals_raw, vocals_processed, dereverb_model)
+                dereverb_applied = True
             except Exception as e:
                 logger.warning("Dereverberation failed, using raw audio: %s", e)
                 shutil.copy2(vocals_raw, vocals_processed)
@@ -177,28 +176,18 @@ def process_track(
         segments_dir = tmp / "segments"
         output_csv = None
 
-        if do_desilence:
-            seg_paths, segments, csv_path = desilence_and_track(
-                vocals_processed, segments_dir,
-                min_silence_len=min_silence_len,
-                silence_thresh=silence_thresh,
-                keep_silence=keep_silence,
-                min_segment_len=min_segment_len,
-            )
-            if not seg_paths:
-                logger.warning("No segments found for %s", input_audio.name)
-                return None
-            output_csv = output_dir / f"{vocals_processed.stem}_vad_seg_ts.csv"
-            shutil.copy2(csv_path, output_csv)
-        else:
-            logger.info("Desilencing skipped — treating whole track as one segment")
-            segments_dir.mkdir(parents=True, exist_ok=True)
-            single_seg = segments_dir / "00001.wav"
-            shutil.copy2(vocals_processed, single_seg)
-            audio_dur = AudioSegment.from_file(str(vocals_processed))
-            segments = [VocalSegment(index=1, start_ms=0, end_ms=len(audio_dur),
-                                    duration_ms=len(audio_dur), filename="00001.wav")]
-            seg_paths = [single_seg]
+        seg_paths, segments, csv_path = desilence_and_track(
+            vocals_processed, segments_dir,
+            min_silence_len=min_silence_len,
+            silence_thresh=silence_thresh,
+            keep_silence=keep_silence,
+            min_segment_len=min_segment_len,
+        )
+        if not seg_paths:
+            logger.warning("No segments found for %s", input_audio.name)
+            return None
+        output_csv = output_dir / f"{vocals_processed.stem}_vad_seg_ts.csv"
+        shutil.copy2(csv_path, output_csv)
 
         num_segments = len(segments)
 
@@ -211,6 +200,9 @@ def process_track(
                 index_path=best_index,
                 f0_up_key=f0_up_key,
                 f0_method=f0_method,
+                index_rate=index_rate,
+                rms_mix_rate=rms_mix_rate,
+                protect=protect,
             )
             if not converted:
                 logger.error("RVC conversion produced no output for %s", input_audio.name)
@@ -260,15 +252,11 @@ def process_track(
             mixed.export(str(final_wav), format="wav")
             logger.info("Final mix exported: %s", final_wav.name)
         else:
-            if do_desilence:
-                audio_dur_obj = AudioSegment.from_file(str(vocals_processed))
-                reassembled = reassemble_from_segments(
-                    final_segments_dir, segments, len(audio_dur_obj),
-                )
-                reassembled.export(str(final_wav), format="wav")
-            else:
-                single_out = final_segments_dir / "00001.wav"
-                shutil.copy2(single_out, final_wav)
+            audio_dur_obj = AudioSegment.from_file(str(vocals_processed))
+            reassembled = reassemble_from_segments(
+                final_segments_dir, segments, len(audio_dur_obj),
+            )
+            reassembled.export(str(final_wav), format="wav")
             if not do_reassembly:
                 logger.info("Reassembly skipped — output is processed audio only")
             elif not do_separation:
@@ -284,14 +272,16 @@ def process_track(
         "stages": {
             "separation": do_separation,
             "dereverberation": dereverb_applied,
-            "desilencing": do_desilence,
+            "desilencing": True,
             "rvc": do_rvc,
             "reassembly": do_reassembly and do_separation,
         },
         "separation_backend": backend_used.value if backend_used else None,
-        "dereverb_probability": dereverb_probability,
         "f0_up_key": f0_up_key,
         "f0_method": f0_method,
+        "index_rate": index_rate,
+        "rms_mix_rate": rms_mix_rate,
+        "protect": protect,
         "num_segments": num_segments,
         "num_converted": num_converted,
         "output_wav": str(final_wav),
@@ -481,8 +471,6 @@ if __name__ == "__main__":
     stage_group = p.add_argument_group("stage toggles")
     stage_group.add_argument("--no-separation", action="store_true",
                              help="Skip source separation — input audio is used directly")
-    stage_group.add_argument("--no-desilence", action="store_true",
-                             help="Skip desilencing — treat the whole track as one segment")
     stage_group.add_argument("--no-rvc", action="store_true",
                              help="Skip RVC voice conversion (--checkpoint-dir not required)")
     stage_group.add_argument("--no-reassembly", action="store_true",
@@ -499,7 +487,6 @@ if __name__ == "__main__":
                                 help="Dereverb backend: vrnet (UVR5 VR-Net) or mbr "
                                      "(MelBandRoformer). Omit to skip dereverberation.")
     dereverb_group.add_argument("--dereverb-device", default="cuda")
-    dereverb_group.add_argument("--dereverb-probability", type=float, default=DEREVERB_PROBABILITY)
 
     silence_group = p.add_argument_group("desilencing")
     silence_group.add_argument("--min-silence-len", type=int, default=2000)
@@ -510,6 +497,12 @@ if __name__ == "__main__":
     rvc_group = p.add_argument_group("rvc")
     rvc_group.add_argument("--f0-up-key", type=int, default=0, help="Pitch shift in semitones")
     rvc_group.add_argument("--f0-method", default="rmvpe")
+    rvc_group.add_argument("--index-rate", type=float, default=0.75,
+                           help="FAISS index influence on timbre (0=model only, 1=index only; default: 0.75)")
+    rvc_group.add_argument("--rms-mix-rate", type=float, default=0.25,
+                           help="Output loudness envelope mix (0=match source, 1=model native; default: 0.25)")
+    rvc_group.add_argument("--protect", type=float, default=0.33,
+                           help="Unvoiced consonant protection (lower=more protection; default: 0.33)")
 
     eval_group = p.add_argument_group("evaluation")
     eval_group.add_argument("--lyrics-eval", action="store_true",
@@ -521,7 +514,6 @@ if __name__ == "__main__":
 
     do_rvc = not args.no_rvc
     do_separation = not args.no_separation
-    do_desilence = not args.no_desilence
     do_reassembly = not args.no_reassembly
 
     if do_rvc and args.checkpoint_dir is None:
@@ -560,16 +552,17 @@ if __name__ == "__main__":
     sep_backend = SeparationBackend(args.sep_backend) if args.sep_backend else None
     common_kwargs = dict(
         sep_backend=sep_backend,
-        dereverb_probability=args.dereverb_probability,
         device=args.device,
         f0_up_key=args.f0_up_key,
         f0_method=args.f0_method,
+        index_rate=args.index_rate,
+        rms_mix_rate=args.rms_mix_rate,
+        protect=args.protect,
         min_silence_len=args.min_silence_len,
         silence_thresh=args.silence_thresh,
         keep_silence=args.keep_silence,
         min_segment_len=args.min_segment_len,
         do_separation=do_separation,
-        do_desilence=do_desilence,
         do_rvc=do_rvc,
         do_reassembly=do_reassembly,
         do_lyrics_eval=args.lyrics_eval,

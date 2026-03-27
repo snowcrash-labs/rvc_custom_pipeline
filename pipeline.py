@@ -198,10 +198,12 @@ def _run_vc_pipeline(
     f0_up_key: int,
     sep_backend: str,
     f0_method: str = "rmvpe",
+    index_rate: float = 0.75,
+    rms_mix_rate: float = 0.25,
+    protect: float = 0.33,
     force: bool = False,
     pre_separated_vocals: Path | None = None,
     dereverb_backend: str | None = None,
-    do_desilence: bool = False,
     do_reassembly: bool = False,
     do_lyrics_eval: bool = False,
     whisper_model: str = "turbo",
@@ -227,6 +229,9 @@ def _run_vc_pipeline(
         "--output-dir", str(output_dir),
         "--f0-up-key", str(f0_up_key),
         "--f0-method", f0_method,
+        "--index-rate", str(index_rate),
+        "--rms-mix-rate", str(rms_mix_rate),
+        "--protect", str(protect),
     ]
     if skip_sep:
         cmd.append("--no-separation")
@@ -234,8 +239,6 @@ def _run_vc_pipeline(
         cmd.extend(["--sep-backend", sep_backend])
     if dereverb_backend:
         cmd.extend(["--dereverb-backend", dereverb_backend])
-    if not do_desilence:
-        cmd.append("--no-desilence")
     if not do_reassembly:
         cmd.append("--no-reassembly")
     if do_lyrics_eval:
@@ -271,6 +274,12 @@ def main():
                    choices=["demucs", "roformer", "mdxchain", "uvr5"],
                    help="Separation backend (default: mdxchain)")
     p.add_argument("--f0-method", default="rmvpe")
+    p.add_argument("--index-rate", type=float, default=0.75,
+                   help="FAISS index influence on timbre (0=model only, 1=index only; default: 0.75)")
+    p.add_argument("--rms-mix-rate", type=float, default=0.25,
+                   help="Output loudness envelope mix (0=match source, 1=model native; default: 0.25)")
+    p.add_argument("--protect", type=float, default=0.33,
+                   help="Unvoiced consonant protection (lower=more protection; default: 0.33)")
     p.add_argument("--std-threshold", type=float, default=3.0,
                    help="Pitch std threshold in semitones for stability analysis (default: 3.0)")
     p.add_argument("--voiced-threshold", type=float, default=0.9,
@@ -283,8 +292,6 @@ def main():
                    help="Torch device for separation (default: auto)")
     p.add_argument("--dereverb-backend", choices=["vrnet", "mbr"], default=None,
                    help="Dereverb backend passed to vc_pipeline.py (omit to skip)")
-    p.add_argument("--no-desilence", action="store_true",
-                   help="Skip desilencing — treat the whole track as one segment")
     p.add_argument("--no-reassembly", action="store_true",
                    help="Skip reassembly — output processed audio without mixing "
                         "back with the instrumental stem")
@@ -391,10 +398,12 @@ def main():
         f0_up_key=f0_up_key,
         sep_backend=args.sep_backend,
         f0_method=args.f0_method,
+        index_rate=args.index_rate,
+        rms_mix_rate=args.rms_mix_rate,
+        protect=args.protect,
         force=args.force,
         pre_separated_vocals=vocals_path,
         dereverb_backend=args.dereverb_backend,
-        do_desilence=not args.no_desilence,
         do_reassembly=not args.no_reassembly,
         do_lyrics_eval=args.lyrics_eval,
         whisper_model=args.whisper_model,

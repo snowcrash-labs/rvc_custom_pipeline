@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dereverberation with selectable backends, applied stochastically.
+"""Dereverberation with selectable backends.
 
 Two backends are supported:
 
@@ -8,8 +8,8 @@ Two backends are supported:
 
 Both backends auto-download model weights on first use.
 
-In the SVDD pipeline, dereverberation is applied 53 % of the time so
-the detection model sees a mixture of reverberant and dry vocals.
+Whether dereverberation is applied is controlled by the caller
+(e.g. ``vc_pipeline.py``) via the ``--dereverb-backend`` flag.
 """
 from __future__ import annotations
 
@@ -25,7 +25,6 @@ from pedalboard import Pedalboard, NoiseGate
 
 logger = logging.getLogger(__name__)
 
-DEREVERB_PROBABILITY = 0.53
 MODELS_DIR = Path(__file__).parent / "models" / "audio-separator"
 
 
@@ -156,41 +155,21 @@ class DereverbMelBandRoformer:
         return wav_out, sr_out
 
 
-def maybe_dereverb(
+def apply_dereverb(
     vocals_path: Path,
     output_path: Path,
-    dereverb_model=None,
-    probability: float = DEREVERB_PROBABILITY,
-    force: Optional[bool] = None,
-) -> Tuple[Path, bool]:
-    """Conditionally apply dereverberation.
+    dereverb_model,
+) -> Path:
+    """Apply dereverberation to a vocal track.
 
     Args:
         vocals_path: input vocal wav.
-        output_path: where to write (possibly dereverberated) output.
+        output_path: where to write the dereverberated output.
         dereverb_model: a loaded Dereverberation or DereverbMelBandRoformer.
-        probability: chance of applying dereverb (default 0.53).
-        force: if True always apply, if False never apply, None = stochastic.
 
     Returns:
-        (output_path, was_applied).
+        output_path.
     """
-    import random, shutil
-
-    apply = force if force is not None else (random.random() < probability)
-
-    if not apply:
-        if vocals_path != output_path:
-            shutil.copy2(vocals_path, output_path)
-        logger.info("Dereverberation skipped (p=%.2f) for %s", probability, vocals_path.name)
-        return output_path, False
-
-    if dereverb_model is None:
-        raise RuntimeError(
-            "Dereverberation was selected but no model instance was provided. "
-            "Pass --dereverb-backend to enable dereverberation."
-        )
-
     import librosa
     wav, sr = librosa.load(str(vocals_path), sr=None, mono=False)
     if wav.ndim == 2:
@@ -203,7 +182,7 @@ def maybe_dereverb(
 
     sf.write(str(output_path), wav_out, sr_out, subtype="PCM_16")
     logger.info("Dereverberation applied to %s -> %s", vocals_path.name, output_path.name)
-    return output_path, True
+    return output_path
 
 
 if __name__ == "__main__":
@@ -215,7 +194,6 @@ if __name__ == "__main__":
     p.add_argument("--output", type=Path, default=None)
     p.add_argument("--backend", choices=["vrnet", "mbr"], default="mbr",
                    help="Dereverb backend (default: mbr)")
-    p.add_argument("--force", action="store_true", help="Always apply (ignore probability)")
     p.add_argument("--device", default="cuda")
     args = p.parse_args()
 
@@ -223,4 +201,4 @@ if __name__ == "__main__":
     model = DereverbMelBandRoformer(device=args.device) if args.backend == "mbr" \
         else Dereverberation(device=args.device)
     model.load()
-    maybe_dereverb(args.input, out, dereverb_model=model, force=args.force or None)
+    apply_dereverb(args.input, out, dereverb_model=model)

@@ -106,6 +106,9 @@ def run_rvc_infer(
     index_path: Optional[Path] = None,
     f0_up_key: int = 0,
     f0_method: str = "rmvpe",
+    index_rate: float = 0.75,
+    rms_mix_rate: float = 0.25,
+    protect: float = 0.33,
 ) -> bool:
     """Run RVC inference using the Python API directly."""
     try:
@@ -126,11 +129,11 @@ def run_rvc_infer(
             f0_up_key=f0_up_key,
             f0_method=f0_method,
             index_file=index_str,
-            index_rate=0.75,
+            index_rate=index_rate,
             filter_radius=3,
             resample_sr=0,
-            rms_mix_rate=0.25,
-            protect=0.33,
+            rms_mix_rate=rms_mix_rate,
+            protect=protect,
             hubert_path=os.environ.get("hubert_path"),
         )
         if audio_opt is None:
@@ -165,6 +168,9 @@ def convert_segments(
     index_path: Optional[Path] = None,
     f0_up_key: int = 0,
     f0_method: str = "rmvpe",
+    index_rate: float = 0.75,
+    rms_mix_rate: float = 0.25,
+    protect: float = 0.33,
 ) -> List[Path]:
     """Convert a list of vocal segment wavs through RVC.
 
@@ -181,6 +187,9 @@ def convert_segments(
             index_path=index_path,
             f0_up_key=f0_up_key,
             f0_method=f0_method,
+            index_rate=index_rate,
+            rms_mix_rate=rms_mix_rate,
+            protect=protect,
         )
         if ok:
             converted.append(out_path)
@@ -276,6 +285,12 @@ if __name__ == "__main__":
     p.add_argument("--checkpoint-dir", type=Path, required=True)
     p.add_argument("--f0-up-key", type=int, default=0)
     p.add_argument("--f0-method", default="rmvpe")
+    p.add_argument("--index-rate", type=float, default=0.75,
+                   help="FAISS index influence on timbre (0=model only, 1=index only; default: 0.75)")
+    p.add_argument("--rms-mix-rate", type=float, default=0.25,
+                   help="Output loudness envelope mix (0=match source, 1=model native; default: 0.25)")
+    p.add_argument("--protect", type=float, default=0.33,
+                   help="Unvoiced consonant protection (lower=more protection; default: 0.33)")
     args = p.parse_args()
 
     pth_candidates, best_index = find_checkpoint_files(args.checkpoint_dir)
@@ -289,4 +304,7 @@ if __name__ == "__main__":
         index_path=best_index,
         f0_up_key=args.f0_up_key,
         f0_method=args.f0_method,
+        index_rate=args.index_rate,
+        rms_mix_rate=args.rms_mix_rate,
+        protect=args.protect,
     )
