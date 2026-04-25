@@ -1,2 +1,7 @@
 __pycache__/
 models/
+test_audio/
+outputs/
+*.wav
+*.csv
+*.txt
